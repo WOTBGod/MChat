@@ -1,7 +1,9 @@
 import Foundation
 
-// Builds the vault index, reusing saved results for notes that haven't changed
 nonisolated enum VaultIndexer {
+
+    /// Files that are instructions for AI tools, not the user's notes
+    static let skippedFiles: Set<String> = ["claude.md", "agents.md"]
 
     nonisolated struct CachedFile: Codable, Sendable {
         let name: String
@@ -12,17 +14,16 @@ nonisolated enum VaultIndexer {
 
     nonisolated struct Cache: Codable, Sendable {
         var folderPath: String
-        var files: [String: CachedFile]     // key = file path inside the vault
+        var files: [String: CachedFile]
     }
 
     nonisolated struct Result: Sendable {
         let search: VaultSearch
-        let indexed: Int     // new or changed notes that were (re)embedded
-        let reused: Int      // unchanged notes loaded from the cache
-        let removed: Int     // notes deleted since last time
+        let indexed: Int
+        let reused: Int
+        let removed: Int
     }
 
-    /// Where the saved index lives (inside the app's own private folder)
     static var cacheURL: URL {
         FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
             .appendingPathComponent("VaultIndex.plist")
@@ -32,17 +33,17 @@ nonisolated enum VaultIndexer {
         try? FileManager.default.removeItem(at: cacheURL)
     }
 
-    /// Slow part: runs in the background. `progress` is called with (done, total).
     static func build(folder: URL, progress: @Sendable (Int, Int) -> Void) -> Result {
         let old = loadCache(folderPath: folder.path)
 
-        // 1. List every note with its modified date and size
         let keys: [URLResourceKey] = [.contentModificationDateKey, .fileSizeKey]
         var found: [(url: URL, key: String, modified: Date, size: Int)] = []
         if let files = FileManager.default.enumerator(at: folder,
                                                       includingPropertiesForKeys: keys,
                                                       options: [.skipsHiddenFiles]) {
-            for case let url as URL in files where ["md", "txt"].contains(url.pathExtension.lowercased()) {
+            for case let url as URL in files
+            where ["md", "txt"].contains(url.pathExtension.lowercased())
+               && !skippedFiles.contains(url.lastPathComponent.lowercased()) {
                 let values = try? url.resourceValues(forKeys: Set(keys))
                 let key = String(url.path.dropFirst(folder.path.count))
                 found.append((url, key,
@@ -51,7 +52,6 @@ nonisolated enum VaultIndexer {
             }
         }
 
-        // 2. Reuse unchanged notes, embed new or changed ones
         let embedding = VaultSearch.makeEmbedding()
         var newFiles: [String: CachedFile] = [:]
         var indexed = 0, reused = 0
@@ -78,13 +78,11 @@ nonisolated enum VaultIndexer {
             }
         }
 
-        // 3. Save the cache only if something changed
         let removed = old.map { $0.files.keys.filter { newFiles[$0] == nil }.count } ?? 0
         if indexed > 0 || removed > 0 || old == nil {
             saveCache(Cache(folderPath: folder.path, files: newFiles))
         }
 
-        // 4. Build the searchable index
         let ordered = newFiles.keys.sorted().compactMap { newFiles[$0] }
         let search = VaultSearch(
             chunks: ordered.flatMap(\.chunks),
@@ -92,8 +90,6 @@ nonisolated enum VaultIndexer {
         )
         return Result(search: search, indexed: indexed, reused: reused, removed: removed)
     }
-
-    // MARK: - Saving and loading
 
     private static func loadCache(folderPath: String) -> Cache? {
         guard let data = try? Data(contentsOf: cacheURL),

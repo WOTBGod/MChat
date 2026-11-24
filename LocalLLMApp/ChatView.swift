@@ -23,6 +23,23 @@ struct ChatView: View {
         "this document", "this pdf", "key points", "main points", "tl;dr", "tldr"
     ]
 
+    static let listPhrases = [
+        "list", "all the", "all of", "every", "how many", "what are the", "which ones",
+        "show me all", "everything", "count", "total"
+    ]
+
+    // Requests to repeat or reformat the last answer: no note search needed
+    static let repeatPhrases = [
+        "retype", "repeat", "same list", "say that again", "again", "reformat",
+        "as a table", "shorter", "rephrase"
+    ]
+
+    /// Largest amount of one note we'll send whole (~2,000 tokens)
+    static let wholeNoteCharLimit = 8_000
+
+    /// Questions this short are treated as follow-ups and searched with the previous question
+    static let followUpWordLimit = 10
+
     let conversation: Conversation
     let vault: VaultSearch?
     let useVault: Bool
@@ -35,7 +52,7 @@ struct ChatView: View {
     @State private var draft = ""
     @State private var isResponding = false
     @State private var responseTask: Task<Void, Never>?
-    @State private var tokenCount: Int?          // exact count from the model, when available
+    @State private var tokenCount: Int?
     @FocusState private var inputFocused: Bool
 
     // Attachments
@@ -60,10 +77,8 @@ struct ChatView: View {
 
     // MARK: - Memory meter
 
-    /// The model's real context limit (8,192 on your Mac)
     var contextLimit: Int { SystemLanguageModel.default.contextSize }
 
-    /// Everything the current session has seen, as one block of text
     var sessionText: String {
         ([instructionsText] + conversation.sortedMessages
             .filter { $0.order >= sessionStartOrder && !$0.isNotice }
@@ -71,7 +86,6 @@ struct ChatView: View {
             .joined(separator: "\n")
     }
 
-    /// Exact count if we have it, otherwise the quick estimate
     var displayedTokens: Int { tokenCount ?? sessionText.count / 4 }
 
     func refreshTokenCount() async {
@@ -247,15 +261,33 @@ struct ChatView: View {
 
     // MARK: - Building the prompt
 
-    func buildPrompt(for question: String) -> (prompt: String, sources: [String]) {
+    func buildPrompt(for question: String, previousQuestion: String?) -> (prompt: String, sources: [String]) {
         let lower = question.lowercased()
+        // "Retype that" / "repeat the list": answer from the conversation, not the notes
+        if Self.repeatPhrases.contains(where: { lower.contains($0) }) {
+            return ("\(question)\n\n(Use your previous answer in this conversation.)", [])
+        }
+
+        // Short follow-ups are searched together with the previous question
+        let wordCount = question.split(separator: " ").count
+        let searchQuery: String
+        if let previousQuestion, wordCount <= Self.followUpWordLimit {
+            searchQuery = previousQuestion + " " + question
+        } else {
+            searchQuery = question
+        }
+        let searchLower = searchQuery.lowercased()
+
+        let isListQuestion = Self.listPhrases.contains { lower.contains($0) }
         var parts: [String] = []
         var allHits: [NoteChunk] = []
+        var mayBeIncomplete = false
 
+        // 1. Attached files
         if let attachmentIndex {
             let wantsOverview = Self.overviewPhrases.contains { lower.contains($0) }
             var fileHits = wantsOverview ? attachmentIndex.firstChunks(3) : []
-            for hit in attachmentIndex.search(question, limit: 3)
+            for hit in attachmentIndex.search(searchQuery, limit: 3)
             where !fileHits.contains(where: { $0.text == hit.text }) {
                 fileHits.append(hit)
             }
@@ -266,38 +298,69 @@ struct ChatView: View {
             parts.append("The user attached these files to this chat: \(names)")
             parts.append("Excerpts from the attached files:\n" + Self.format(fileHits))
             allHits += fileHits
+            if isListQuestion { mayBeIncomplete = true }
         }
 
+        // 2. Vault notes
         if useVault, let vault {
-            let isProgressQuestion = Self.progressPhrases.contains { lower.contains($0) }
+            let isProgressQuestion = Self.progressPhrases.contains { searchLower.contains($0) }
             let limit = attachmentIndex == nil ? 3 : 2
+            var vaultHits: [NoteChunk] = []
+            var wholeNoteName: String?
 
-            var vaultHits = isProgressQuestion ? vault.latestNoteChunks(limit: 2) : []
-            for hit in vault.search(question, limit: limit)
-            where !vaultHits.contains(where: { $0.text == hit.text }) {
-                vaultHits.append(hit)
+            // A note named in the question, or the best note for a list question
+            var target = vault.noteNamed(in: searchQuery)
+            if target == nil && isListQuestion {
+                target = vault.bestNotesForList(searchQuery).first
+            }
+
+            if let target {
+                var used = 0
+                for chunk in vault.allChunks(ofNote: target) {
+                    if used + chunk.text.count > Self.wholeNoteCharLimit {
+                        mayBeIncomplete = true      // note was cut short to fit
+                        break
+                    }
+                    vaultHits.append(chunk)
+                    used += chunk.text.count
+                }
+                wholeNoteName = target
+            } else {
+                if isProgressQuestion { vaultHits = vault.latestNoteChunks(limit: 2) }
+                for hit in vault.search(searchQuery, limit: limit)
+                where !vaultHits.contains(where: { $0.text == hit.text }) {
+                    vaultHits.append(hit)
+                }
+                if isListQuestion { mayBeIncomplete = true }
             }
 
             if !vaultDescription.isEmpty {
                 parts.append("About the user's notes vault: \(vaultDescription)")
             }
-            if isProgressQuestion || attachmentIndex == nil {
+            if isProgressQuestion || (attachmentIndex == nil && wholeNoteName == nil) {
                 parts.append("Notes the user edited most recently (newest first):\n\(vault.recentNotesSummary())")
             }
             if !vaultHits.isEmpty {
-                parts.append("Relevant note excerpts:\n" + Self.format(vaultHits))
+                let header = wholeNoteName.map { "The note \"\($0)\" (in full unless noted):" }
+                    ?? "Relevant note excerpts:"
+                parts.append(header + "\n" + Self.format(vaultHits))
             }
             allHits += vaultHits
         }
 
         guard !parts.isEmpty else { return (question, []) }
 
-        parts.append("""
+        var rules = """
         Use the information above as your main source. You can draw reasonable conclusions from it. \
         If it truly doesn't help, answer from general knowledge and mention that briefly.
+        """
+        if mayBeIncomplete {
+            rules += " You may not have the complete information. If the question asks for a full list or a count, say the list may be incomplete."
+        } else if isListQuestion {
+            rules += " You were given the complete note, so list every matching item from it."
+        }
 
-        Question: \(question)
-        """)
+        parts.append("\(rules)\n\nQuestion: \(question)")
 
         let sources = Array(Set(allHits.map(\.fileName))).sorted()
         return (parts.joined(separator: "\n\n"), sources)
@@ -310,7 +373,6 @@ struct ChatView: View {
 
     // MARK: - Errors
 
-    /// Plain-English messages for the model's error types (new in macOS 27)
     static func friendlyMessage(for error: LanguageModelError) -> String {
         switch error {
         case .refusal:
@@ -338,7 +400,8 @@ struct ChatView: View {
         let question = draft.trimmingCharacters(in: .whitespaces)
         guard !question.isEmpty, !isResponding else { return }
 
-        let (modelPrompt, sources) = buildPrompt(for: question)
+        let previousQuestion = conversation.sortedMessages.last(where: { $0.isUser })?.text
+        let (modelPrompt, sources) = buildPrompt(for: question, previousQuestion: previousQuestion)
         print("\n===== PROMPT SENT TO MODEL =====\n\(modelPrompt)\n================================")
 
         let next = (conversation.sortedMessages.last?.order ?? -1) + 1
@@ -489,9 +552,21 @@ struct MessageBubble: View {
     }
 
     static func formatted(_ text: String) -> AttributedString {
+        var t = text
+
+        // Obsidian links: [[Note|Shown name]] -> Shown name, [[Note]] -> Note
+        t = t.replacingOccurrences(of: #"\[\[([^\]|]+)\|([^\]]+)\]\]"#, with: "$2", options: .regularExpression)
+        t = t.replacingOccurrences(of: #"\[\[([^\]]+)\]\]"#, with: "$1", options: .regularExpression)
+
+        // Bullets at the start of a line: "- item" or "* item" -> "• item"
+        t = t.replacingOccurrences(of: #"(?m)^(\s*)[-*+]\s+"#, with: "$1• ", options: .regularExpression)
+
+        // Headings: "## Title" -> bold
+        t = t.replacingOccurrences(of: #"(?m)^#{1,6}\s+(.+)$"#, with: "**$1**", options: .regularExpression)
+
         let options = AttributedString.MarkdownParsingOptions(
             interpretedSyntax: .inlineOnlyPreservingWhitespace
         )
-        return (try? AttributedString(markdown: text, options: options)) ?? AttributedString(text)
+        return (try? AttributedString(markdown: t, options: options)) ?? AttributedString(t)
     }
 }
